@@ -1,9 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 import logging
 import os
 import io
+from pathlib import Path
+import json
+
+from aiogram import Bot, Dispatcher, types, filters, InlineQueryHandler, CallbackQueryHandler, error_handler
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.utils import exceptions as aiogram_exceptions
+from aiogram.types import InputTextMessageContent, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.ext.callback_query_handler import ChatActionsFilter
+
+import constants
+import config
+from config import Settings
+from localized_text import localized_text
+from utils import get_thread_id, is_allowed, is_within_budget, add_chat_request_to_usage_tracker, cleanup_intermediate_files, \
+    wrap_with_indicator, edit_message_with_retry, is_direct_result, stream_response_generator, get_stream_cutoff_values
+import chatgpt
+import openai
+from commands_handler import help_command, stats_command, resend_command
 
 from uuid import uuid4
 from telegram import BotCommandScopeAllGroupChats, Update, constants
@@ -107,14 +126,14 @@ class ChatGPTTelegramBot:
         chat_messages, chat_token_length = self.openai.get_conversation_stats(chat_id)
         remaining_budget = get_remaining_budget(self.config, self.usage, update)
         bot_language = self.config['bot_language']
-        
+
         text_current_conversation = (
             f"*{localized_text('stats_conversation', bot_language)[0]}*:\n"
             f"{chat_messages} {localized_text('stats_conversation', bot_language)[1]}\n"
             f"{chat_token_length} {localized_text('stats_conversation', bot_language)[2]}\n"
             "----------------------------\n"
         )
-        
+
         # Check if image generation is enabled and, if so, generate the image statistics for today
         text_today_images = ""
         if self.config.get('enable_image_generation', False):
@@ -127,7 +146,7 @@ class ChatGPTTelegramBot:
         text_today_tts = ""
         if self.config.get('enable_tts_generation', False):
             text_today_tts = f"{characters_today} {localized_text('stats_tts', bot_language)}\n"
-        
+
         text_today = (
             f"*{localized_text('usage_today', bot_language)}:*\n"
             f"{tokens_today} {localized_text('stats_tokens', bot_language)}\n"
@@ -139,7 +158,7 @@ class ChatGPTTelegramBot:
             f"{localized_text('stats_total', bot_language)}{current_cost['cost_today']:.2f}\n"
             "----------------------------\n"
         )
-        
+
         text_month_images = ""
         if self.config.get('enable_image_generation', False):
             text_month_images = f"{images_month} {localized_text('stats_images', bot_language)}\n"
@@ -151,7 +170,7 @@ class ChatGPTTelegramBot:
         text_month_tts = ""
         if self.config.get('enable_tts_generation', False):
             text_month_tts = f"{characters_month} {localized_text('stats_tts', bot_language)}\n"
-        
+
         # Check if image generation is enabled and, if so, generate the image statistics for the month
         text_month = (
             f"*{localized_text('usage_month', bot_language)}:*\n"
@@ -274,6 +293,26 @@ class ChatGPTTelegramBot:
                 if str(user_id) not in self.config['allowed_user_ids'].split(',') and 'guests' in self.usage:
                     self.usage["guests"].add_image_request(image_size, self.config['image_prices'])
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class MyBot:
+    def __init__(self):
+        self.config = Settings()
+        current_file_path = Path(__file__).resolve()
+        base_dir = current_file_path.parents[1]
+        translations_file_path = base_dir / 'translations.json'
+        
+        with open(translations_file_path, 'r', encoding='utf-8') as file:
+            self.translations_data = json.load(file)
+
+        self.usage = config.UsageTracker(self.config['usage_limit'])
+        self.disallowed_message = localized_text('disallowed_message', self.config['bot_language'])
+        self.budget_limit_message = localized_text('budget_limit_message', self.config['bot_language'])
+
+    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        try:
+            await wrap_with_indicator(update, context, self.send_chat_response, constants.ChatAction.TYPING)
             except Exception as e:
                 logging.exception(e)
                 await update.effective_message.reply_text(
@@ -471,9 +510,9 @@ class ChatGPTTelegramBot:
                    (prompt is not None and not prompt.lower().startswith(trigger_keyword.lower())):
                     logging.info('Vision coming from group chat with wrong keyword, ignoring...')
                     return
-        
+
         image = update.message.effective_attachment[-1]
-        
+
 
         async def _execute():
             bot_language = self.config['bot_language']
@@ -492,14 +531,14 @@ class ChatGPTTelegramBot:
                     parse_mode=constants.ParseMode.MARKDOWN
                 )
                 return
-            
+
             # convert jpg from telegram to png as understood by openai
 
             temp_file_png = io.BytesIO()
 
             try:
                 original_image = Image.open(temp_file)
-                
+
                 original_image.save(temp_file_png, format='PNG')
                 logging.info(f'New vision request received from user {update.message.from_user.name} '
                              f'(id: {update.message.from_user.id})')
@@ -511,8 +550,8 @@ class ChatGPTTelegramBot:
                     reply_to_message_id=get_reply_to_message_id(self.config, update),
                     text=localized_text('media_type_fail', bot_language)
                 )
-            
-            
+
+
 
             user_id = update.message.from_user.id
             if user_id not in self.usage:
@@ -597,7 +636,7 @@ class ChatGPTTelegramBot:
                     if tokens != 'not_finished':
                         total_tokens = int(tokens)
 
-                
+
             else:
 
                 try:
@@ -650,6 +689,14 @@ class ChatGPTTelegramBot:
         if update.edited_message or not update.message or update.message.via_bot:
             return
 
+            logging.error(f'Failed to respond to a message: {e}')
+            await context.bot.send_message(chat_id=update.effective_message.chat_id,
+                                           text=f"🤖 {localized_text('chat_fail', self.config['bot_language'])} {str(e)}")
+
+    async def send_chat_response(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.message.chat.id
+        message_content = update.message.text
+        user_id = update.effective_message.from_user.id
         if not await self.check_allowed_and_within_budget(update, context):
             return
 
@@ -671,12 +718,35 @@ class ChatGPTTelegramBot:
                         update.message.reply_to_message.text and \
                         update.message.reply_to_message.from_user.id != context.bot.id:
                     prompt = f'"{update.message.reply_to_message.text}" {prompt}'
+        query = message_content
+        if len(query.strip()) > 0 and not is_direct_result(query):
+            async for content in stream_response_generator(self.openai.get_chat_response, chat_id=chat_id,
+                                                            user_id=user_id, query=query):
+                await edit_message_with_retry(context, chat_id=chat_id, message_id=None, text=content)
             else:
                 if update.message.reply_to_message and update.message.reply_to_message.from_user.id == context.bot.id:
                     logging.info('Message is a reply to the bot, allowing...')
                 else:
                     logging.warning('Message does not start with trigger keyword, ignoring...')
+            answer = self.openai.get_chat_response(chat_id=chat_id, user_id=user_id, query=query)
+            if is_direct_result(answer):
+                cleanup_intermediate_files(answer)
+                return
+            await context.bot.send_message(chat_id=chat_id,
+                                           text=f"🤖 {answer}",
+                                           parse_mode='Markdown')
+
+    async def handle_image(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_message.chat.id
+
+        if not await self.check_allowed_and_within_budget(update, context):
                     return
+
+        query = update.message.text
+        image_bytes = await self.openai.generate_image(query)
+        if image_bytes is not None and len(image_bytes) > 0:
+            with open('temp_image.png', 'wb') as f:
+                f.write(image_bytes)
 
         try:
             total_tokens = 0
@@ -814,9 +884,27 @@ class ChatGPTTelegramBot:
         """
         query = update.inline_query.query
         if len(query) < 3:
+                await context.bot.send_photo(chat_id=chat_id, photo=open('temp_image.png', 'rb'))
+            finally:
+                Path('temp_image.png').unlink()
+
+    async def handle_tts(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.effective_message.chat.id
+
+        if not await self.check_allowed_and_within_budget(update, context):
             return
         if not await self.check_allowed_and_within_budget(update, context, is_inline=True):
             return
+
+        query = update.message.text
+        text_bytes = await self.openai.generate_audio(query)
+        if text_bytes is not None and len(text_bytes) > 0:
+            with open('temp_audio.mp3', 'wb') as f:
+                f.write(text_bytes)
+            try:
+                await context.bot.send_voice(chat_id=chat_id, voice=open('temp_audio.mp3', 'rb'))
+            finally:
+                Path('temp_audio.mp3').unlink()
 
         callback_data_suffix = "gpt:"
         result_id = str(uuid4())
@@ -882,6 +970,8 @@ class ChatGPTTelegramBot:
                     await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
                                                   text=f'{query}\n\n_{answer_tr}:_\n{error_message}',
                                                   is_inline=True)
+    async def handle_vision(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_allowed_and_within_budget(update, context):
                     return
 
                 unavailable_message = localized_text("function_unavailable_in_inline_mode", bot_language)
@@ -906,6 +996,8 @@ class ChatGPTTelegramBot:
                         cutoff += backoff
 
                         if i == 0:
+        file = update.message.photo[-1]
+        file_id = file.file_id
                             try:
                                 await edit_message_with_retry(context, chat_id=None,
                                                               message_id=inline_message_id,
@@ -962,6 +1054,9 @@ class ChatGPTTelegramBot:
                                                           message_id=inline_message_id,
                                                           text=f'{query}\n\n_{answer_tr}:_\n{unavailable_message}',
                                                           is_inline=True)
+            image_bytes = await self.openai.get_image_from_file(file_id)
+        except aiogram_exceptions.BadRequest as e:
+            logging.error(f'Failed to get the photo: {e}')
                             return
 
                         text_content = f'{query}\n\n_{answer_tr}:_\n{response}'
@@ -1020,6 +1115,42 @@ class ChatGPTTelegramBot:
                 disable_web_page_preview=True
             )
         else:
+        answer, response_type = await self.openai.get_chat_response_vision(image_bytes)
+        if is_direct_result(answer):
+            cleanup_intermediate_files(answer)
+            return
+        await context.bot.send_message(chat_id=update.effective_message.chat.id,
+                                       text=f"🤖 {answer}",
+                                       parse_mode='Markdown')
+
+    async def handle_transcribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not await self.check_allowed_and_within_budget(update, context):
+            return
+
+        file = update.message.voice or update.message.video_note
+        file_id = file.file_id
+        try:
+            audio_bytes = await self.openai.get_audio_from_file(file_id)
+        except aiogram_exceptions.BadRequest as e:
+            logging.error(f'Failed to get the voice message: {e}')
+            return
+
+        answer, response_type = await self.openai.get_chat_response_vision(audio_bytes)
+        if is_direct_result(answer):
+            cleanup_intermediate_files(answer)
+            return
+        await context.bot.send_message(chat_id=update.effective_message.chat.id,
+                                       text=f"🤖 {answer}",
+                                       parse_mode='Markdown')
+
+    async def resend(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        chat_id = update.message.chat.id
+
+        if not await self.check_allowed_and_within_budget(update, context):
+            return
+
+        message_content = update.message.text
+        user_id = update.effective_message.from_user.id
             result_id = str(uuid4())
             await self.send_inline_query_result(update, result_id, message_content=self.disallowed_message)
 
@@ -1033,6 +1164,38 @@ class ChatGPTTelegramBot:
                 text=self.budget_limit_message
             )
         else:
+        self.resend_cache[result_id] = (chat_id, message_content)
+        callback_data_suffix = "resend:"
+        callback_data = f'{callback_data_suffix}{result_id}'
+
+        await context.bot.send_message(chat_id=update.message.chat.id,
+                                       text=f"🤖 {localized_text('resend_button', self.config['bot_language'])}",
+                                       reply_markup=self.resend_keyboard(result_id, chat_id),
+                                       parse_mode='Markdown')
+
+    def resend_keyboard(self, result_id, chat_id) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup([[InlineKeyboardButton(
+            text=f'🔄 {localized_text("resend", self.config["bot_language"])}',
+            callback_data=f'resend:{result_id}'
+        )]])
+
+    async def handle_resend_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        result_id = update.callback_query.data.split(':')[1]
+        chat_id, message_content = self.resend_cache[result_id]
+
+        await context.bot.copy_message(chat_id=update.effective_chat.id,
+                                       from_chat_id=chat_id,
+                                       message_id=self.get_inline_message_id(update),
+                                       caption=message_content)
+
+    async def inline_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user_id = update.inline_query.from_user.id
+        name = update.inline_query.from_user.name
+
+        if not await self.check_allowed_and_within_budget(update, context, is_inline=True):
+            return
+
+        query = update.inline_query.query
             result_id = str(uuid4())
             await self.send_inline_query_result(update, result_id, message_content=self.budget_limit_message)
 
@@ -1055,6 +1218,221 @@ class ChatGPTTelegramBot:
             .concurrent_updates(True) \
             .build()
 
+        application.add_handler(CommandHandler('reset', self.reset))
+        application.add_handler(CommandHandler('help', self.help))
+        application.add_handler(CommandHandler('image', self.image))
+        application.add_handler(CommandHandler('tts', self.tts))
+        application.add_handler(CommandHandler('start', self.help))
+        application.add_handler(CommandHandler('stats', self.stats))
+        application.add_handler(CommandHandler('resend', self.resend))
+        application.add_handler(CommandHandler(
+            'chat', self.prompt, filters=filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
+        self.inline_queries_cache[result_id] = query
+        callback_data_suffix = "gpt:"
+        message_content = f"🤖 {query}"
+        
+        await context.bot.answer_inline_query(
+            inline_query_id=update.inline_query.id,
+            results=[types.InlineQueryResultArticle(
+                id=result_id,
+                title=localized_text("ask_chatgpt", self.config['bot_language']),
+                input_message_content=types.InputTextMessageContent(message_content),
+                description=message_content,
+                thumb_url='https://user-images.githubusercontent.com/11541888/223106202-7576ff11-2c8e-408d-94ea-b02a7a32149a.png',
+                reply_markup=types.InlineKeyboardMarkup([[types.InlineKeyboardButton(
+                    text=f'🤖 {localized_text("answer_with_chatgpt", self.config["bot_language"])}',
+                    callback_data=f'{callback_data_suffix}{result_id}'
+                )]])
+            )],
+            cache_time=0
+        )
+
+    async def handle_callback_inline_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        name = update.callback_query.from_user.name
+        user_id = update.callback_query.from_user.id
+        inline_message_id = update.callback_query.inline_message_id
+
+        if not await self.check_allowed_and_within_budget(update, context, is_inline=True):
+            return
+
+        callback_data = update.callback_query.data
+        query = ""
+        bot_language = self.config['bot_language']
+        answer_tr = localized_text("answer", bot_language)
+        loading_tr = localized_text("loading", bot_language)
+
+        if callback_data.startswith("gpt:"):
+            unique_id = callback_data.split(':')[1]
+            total_tokens = 0
+
+            query = self.inline_queries_cache.get(unique_id)
+            if not query:
+                error_message = (
+                    f'{localized_text("error", bot_language)}. '
+                    f'{localized_text("try_again", bot_language)}'
+        )
+        application.add_handler(MessageHandler(
+            filters.PHOTO | filters.Document.IMAGE,
+            self.vision))
+        application.add_handler(MessageHandler(
+            filters.AUDIO | filters.VOICE | filters.Document.AUDIO |
+            filters.VIDEO | filters.VIDEO_NOTE | filters.Document.VIDEO,
+            self.transcribe))
+                await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
+                                              text=f'{query}\n\n_{answer_tr}:_\n{error_message}',
+                                              is_inline=True)
+                return
+
+            unavailable_message = localized_text("function_unavailable_in_inline_mode", bot_language)
+
+            if self.config['stream']:
+                stream_response = self.openai.get_chat_response_stream(chat_id=user_id, query=query)
+                i = 0
+                prev = ''
+                backoff = 0
+                async for content, tokens in stream_response:
+                    if is_direct_result(content):
+                        cleanup_intermediate_files(content)
+                        await edit_message_with_retry(context, chat_id=None,
+                                                      message_id=inline_message_id,
+                                                      text=f'{query}\n\n_{answer_tr}:_\n{unavailable_message}',
+                                                      is_inline=True)
+                        return
+
+                    if len(content.strip()) == 0:
+                        continue
+
+                    cutoff = get_stream_cutoff_values(update, content)
+                    cutoff += backoff
+
+                    if i == 0:
+                        try:
+                            await edit_message_with_retry(context, chat_id=None,
+                                                          message_id=inline_message_id,
+                                                          text=f'{query}\n\n{answer_tr}:\n{content}',
+                                                          is_inline=True)
+                        except Exception as e:
+                            continue
+
+                    elif abs(len(content) - len(prev)) > cutoff or tokens != 'not_finished':
+                        prev = content
+                        try:
+                            use_markdown = tokens != 'not_finished'
+                            divider = '_' if use_markdown else ''
+                            text = f'{query}\n\n{divider}{answer_tr}:{divider}\n{content}'
+
+                            # We only want to send the first 4096 characters. No chunking allowed in inline mode.
+                            text = text[:4096]
+
+                            await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
+                                                          text=text, markdown=use_markdown, is_inline=True)
+
+                        except aiogram_exceptions.RetryAfter as e:
+                            backoff += 5
+                            await asyncio.sleep(e.retry_after)
+                            continue
+                        except aiogram_exceptions.TimedOut:
+                            backoff += 5
+                            await asyncio.sleep(0.5)
+                            continue
+                        except Exception as e:
+                            backoff += 5
+                            continue
+
+                        await asyncio.sleep(0.01)
+
+                    i += 1
+                    if tokens != 'not_finished':
+                        total_tokens = int(tokens)
+
+            else:
+                async def _send_inline_query_response():
+                    nonlocal total_tokens
+                    # Edit the current message to indicate that the answer is being processed
+                    await context.bot.edit_message_text(inline_message_id=inline_message_id,
+                                                        text=f'{query}\n\n_{answer_tr}:_\n{loading_tr}',
+                                                        parse_mode='Markdown')
+
+                    logging.info(f'Generating response for inline query by {name}')
+                    response, total_tokens = await self.openai.get_chat_response(chat_id=user_id, query=query)
+
+                    if is_direct_result(response):
+                        cleanup_intermediate_files(response)
+                        await edit_message_with_retry(context, chat_id=None,
+                                                      message_id=inline_message_id,
+                                                      text=f'{query}\n\n_{answer_tr}:_\n{unavailable_message}',
+                                                      is_inline=True)
+                        return
+
+                    text_content = f'{query}\n\n_{answer_tr}:_\n{response}'
+
+                    # We only want to send the first 4096 characters. No chunking allowed in inline mode.
+                    text_content = text_content[:4096]
+
+                    # Edit the original message with the generated content
+                    await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
+                                                  text=text_content, is_inline=True)
+
+                await wrap_with_indicator(update, context, _send_inline_query_response,
+                                          constants.ChatAction.TYPING, is_inline=True)
+
+            add_chat_request_to_usage_tracker(self.usage, self.config, user_id, total_tokens)
+
+        else:
+            localized_answer = localized_text('chat_fail', bot_language)
+            await edit_message_with_retry(context, chat_id=None, message_id=inline_message_id,
+                                          text=f"{query}\n\n_{answer_tr}:_\n{localized_answer} {str(e)}",
+                                          is_inline=True)
+
+    async def check_allowed_and_within_budget(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                              is_inline=False) -> bool:
+        name = update.inline_query.from_user.name if is_inline else update.message.from_user.name
+        user_id = update.inline_query.from_user.id if is_inline else update.message.from_user.id
+
+        if not await is_allowed(self.config, update, context, is_inline=is_inline):
+            logging.warning(f'User {name} (id: {user_id}) is not allowed to use the bot')
+            await self.send_disallowed_message(update, context, is_inline)
+            return False
+        if not is_within_budget(self.config, self.usage, update, is_inline=is_inline):
+            logging.warning(f'User {name} (id: {user_id}) reached their usage limit')
+            await self.send_budget_reached_message(update, context, is_inline)
+            return False
+
+        return True
+
+    async def send_disallowed_message(self, update: Update, _: ContextTypes.DEFAULT_TYPE, is_inline=False):
+        if not is_inline:
+            await update.effective_message.reply_text(
+                message_thread_id=get_thread_id(update),
+                text=self.disallowed_message,
+                disable_web_page_preview=True
+            )
+        else:
+            result_id = str(uuid4())
+            await self.send_inline_query_result(update, result_id, message_content=self.disallowed_message)
+
+    async def send_budget_reached_message(self, update: Update, _: ContextTypes.DEFAULT_TYPE, is_inline=False):
+        if not is_inline:
+            await update.effective_message.reply_text(
+                message_thread_id=get_thread_id(update),
+                text=self.budget_limit_message
+            )
+        else:
+            result_id = str(uuid4())
+            await self.send_inline_query_result(update, result_id, message_content=self.budget_limit_message)
+
+    async def post_init(self, application: Application) -> None:
+        await application.bot.set_my_commands(self.group_commands, scope=BotCommandScopeAllGroupChats())
+        await application.bot.set_my_commands(self.commands)
+
+    def run(self):
+        application = ApplicationBuilder() \
+            .token(self.config['token']) \
+            .proxy_url(self.config['proxy']) \
+            .get_updates_proxy_url(self.config['proxy']) \
+            .post_init(self.post_init) \
+            .concurrent_updates(True) \
+            .build()
         application.add_handler(CommandHandler('reset', self.reset))
         application.add_handler(CommandHandler('help', self.help))
         application.add_handler(CommandHandler('image', self.image))

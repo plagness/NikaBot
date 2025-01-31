@@ -1,9 +1,9 @@
-version: '3'
 services:
   chatgpt-telegram-bot:
     build:
       context: .
       dockerfile: Dockerfile
     volumes:
-      - .:/app
+      - ./bot:/bot
+      - ./translations.json:/bot/translations.json
     restart: unless-stopped

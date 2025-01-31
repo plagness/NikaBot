@@ -7,7 +7,6 @@ import tiktoken
 
 import openai
 
-import json
 import httpx
 import io
 from PIL import Image
