@@ -5,16 +5,6 @@ from dotenv import load_dotenv
 
 from plugin_manager import PluginManager
 from openai_helper import OpenAIHelper, default_max_tokens, are_functions_available
-# Example configuration for Ollama API
-if os.environ.get('OLLAMA_API_URL') and os.environ.get('MODEL_NAME'):
-    from bot.ollama import OllamaAPI
-    openai_helper = OllamaAPI(
-        api_url=os.environ['OLLAMA_API_URL'],
-        model_name=os.environ['MODEL_NAME']
-    )
-else:
-    logging.error("Missing environment variables for Ollama API configuration.")
-    exit(1)
 from telegram_bot import ChatGPTTelegramBot
 
 
