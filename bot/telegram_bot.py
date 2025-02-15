@@ -28,10 +28,7 @@ class ChatGPTTelegramBot:
     """
     Class representing a ChatGPT Telegram Bot.
     """
-    @property
-    def notify_gif_rejection(self):
-        return self.config.get('notify_gif_rejection', True)
-    
+
     def __init__(self, config: dict, openai: OpenAIHelper):
         """
         Initializes the bot with the given configuration and GPT bot object.
@@ -117,7 +114,7 @@ class ChatGPTTelegramBot:
             f"{chat_token_length} {localized_text('stats_conversation', bot_language)[2]}\n"
             "----------------------------\n"
         )
-        #яб переписал такой бед
+        
         # Check if image generation is enabled and, if so, generate the image statistics for today
         text_today_images = ""
         if self.config.get('enable_image_generation', False):
@@ -333,213 +330,196 @@ class ChatGPTTelegramBot:
                 )
 
         await wrap_with_indicator(update, context, _generate, constants.ChatAction.UPLOAD_VOICE)
-#mod tut
-async def transcribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Transcribe audio messages."""
-    if not self.config['enable_transcription'] or not await self.check_allowed_and_within_budget(update, context):
-        return
 
-    if is_group_chat(update) and self.config['ignore_group_transcriptions']:
-        logging.info('Transcription coming from group chat, ignoring...')
-        return
-
-    chat_id = update.effective_chat.id
-    filename = update.message.effective_attachment.file_unique_id
-
-    async def _execute():
-        filename_mp3 = f'{filename}.mp3'
-        bot_language = self.config['bot_language']
-        try:
-            attachment = update.message.effective_attachment
-            
-            # чекаем на гиф
-            mime_type = getattr(attachment, 'mime_type', '')
-            file_name = getattr(attachment, 'file_name', '').lower()
-            if mime_type == 'image/gif' or file_name.endswith('.gif'):
-                logging.info("GIF file received, ignoring.")
-                if self.config.get('notify_gif_rejection', True):
-                    await update.effective_message.reply_text(
-                        message_thread_id=get_thread_id(update),
-                        reply_to_message_id=get_reply_to_message_id(self.config, update),
-                        text=localized_text('gif_not_supported', bot_language),
-                        parse_mode=constants.ParseMode.MARKDOWN
-                    )
-                return
-
-            media_file = await context.bot.get_file(attachment.file_id)
-            await media_file.download_to_drive(filename)
-            
-        except Exception as e:
-            logging.exception(e)
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                text=(
-                    f"{localized_text('media_download_fail', bot_language)[0]}: "
-                    f"{str(e)}. {localized_text('media_download_fail', bot_language)[1]}"
-                ),
-                parse_mode=constants.ParseMode.MARKDOWN
-            )
+    async def transcribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Transcribe audio messages.
+        """
+        if not self.config['enable_transcription'] or not await self.check_allowed_and_within_budget(update, context):
             return
 
-        try:
-            audio_track = AudioSegment.from_file(filename)
-            audio_track.export(filename_mp3, format="mp3")
-            logging.info(f'New transcribe request received from user {update.message.from_user.name} '
-                         f'(id: {update.message.from_user.id})')
-
-        except Exception as e:
-            logging.exception(e)
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                text=localized_text('media_type_fail', bot_language)
-            )
-            if os.path.exists(filename):
-                os.remove(filename)
+        if is_group_chat(update) and self.config['ignore_group_transcriptions']:
+            logging.info('Transcription coming from group chat, ignoring...')
             return
 
-        user_id = update.message.from_user.id
-        if user_id not in self.usage:
-            self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
+        chat_id = update.effective_chat.id
+        filename = update.message.effective_attachment.file_unique_id
 
-        try:
-            transcript = await self.openai.transcribe(filename_mp3)
-
-            transcription_price = self.config['transcription_price']
-            self.usage[user_id].add_transcription_seconds(audio_track.duration_seconds, transcription_price)
-
-            allowed_user_ids = self.config['allowed_user_ids'].split(',')
-            if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
-                self.usage["guests"].add_transcription_seconds(audio_track.duration_seconds, transcription_price)
-
-            response_to_transcription = any(transcript.lower().startswith(prefix.lower()) if prefix else False
-                                            for prefix in self.config['voice_reply_prompts'])
-
-            if self.config['voice_reply_transcript'] and not response_to_transcription:
-                transcript_output = f"_{localized_text('transcript', bot_language)}:_\n\"{transcript}\""
-                chunks = split_into_chunks(transcript_output)
-
-                for index, transcript_chunk in enumerate(chunks):
-                    await update.effective_message.reply_text(
-                        message_thread_id=get_thread_id(update),
-                        reply_to_message_id=get_reply_to_message_id(self.config, update) if index == 0 else None,
-                        text=transcript_chunk,
-                        parse_mode=constants.ParseMode.MARKDOWN
-                    )
-            else:
-                response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=transcript)
-
-                self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
-                if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
-                    self.usage["guests"].add_chat_tokens(total_tokens, self.config['token_price'])
-
-                transcript_output = (
-                    f"_{localized_text('transcript', bot_language)}:_\n\"{transcript}\"\n\n"
-                    f"_{localized_text('answer', bot_language)}:_\n{response}"
+        async def _execute():
+            filename_mp3 = f'{filename}.mp3'
+            bot_language = self.config['bot_language']
+            try:
+                media_file = await context.bot.get_file(update.message.effective_attachment.file_id)
+                await media_file.download_to_drive(filename)
+            except Exception as e:
+                logging.exception(e)
+                await update.effective_message.reply_text(
+                    message_thread_id=get_thread_id(update),
+                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                    text=(
+                        f"{localized_text('media_download_fail', bot_language)[0]}: "
+                        f"{str(e)}. {localized_text('media_download_fail', bot_language)[1]}"
+                    ),
+                    parse_mode=constants.ParseMode.MARKDOWN
                 )
-                chunks = split_into_chunks(transcript_output)
+                return
 
-                for index, transcript_chunk in enumerate(chunks):
-                    await update.effective_message.reply_text(
-                        message_thread_id=get_thread_id(update),
-                        reply_to_message_id=get_reply_to_message_id(self.config, update) if index == 0 else None,
-                        text=transcript_chunk,
-                        parse_mode=constants.ParseMode.MARKDOWN
+            try:
+                audio_track = AudioSegment.from_file(filename)
+                audio_track.export(filename_mp3, format="mp3")
+                logging.info(f'New transcribe request received from user {update.message.from_user.name} '
+                             f'(id: {update.message.from_user.id})')
+
+            except Exception as e:
+                logging.exception(e)
+                await update.effective_message.reply_text(
+                    message_thread_id=get_thread_id(update),
+                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                    text=localized_text('media_type_fail', bot_language)
+                )
+                if os.path.exists(filename):
+                    os.remove(filename)
+                return
+
+            user_id = update.message.from_user.id
+            if user_id not in self.usage:
+                self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
+
+            try:
+                transcript = await self.openai.transcribe(filename_mp3)
+
+                transcription_price = self.config['transcription_price']
+                self.usage[user_id].add_transcription_seconds(audio_track.duration_seconds, transcription_price)
+
+                allowed_user_ids = self.config['allowed_user_ids'].split(',')
+                if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
+                    self.usage["guests"].add_transcription_seconds(audio_track.duration_seconds, transcription_price)
+
+                # check if transcript starts with any of the prefixes
+                response_to_transcription = any(transcript.lower().startswith(prefix.lower()) if prefix else False
+                                                for prefix in self.config['voice_reply_prompts'])
+
+                if self.config['voice_reply_transcript'] and not response_to_transcription:
+
+                    # Split into chunks of 4096 characters (Telegram's message limit)
+                    transcript_output = f"_{localized_text('transcript', bot_language)}:_\n\"{transcript}\""
+                    chunks = split_into_chunks(transcript_output)
+
+                    for index, transcript_chunk in enumerate(chunks):
+                        await update.effective_message.reply_text(
+                            message_thread_id=get_thread_id(update),
+                            reply_to_message_id=get_reply_to_message_id(self.config, update) if index == 0 else None,
+                            text=transcript_chunk,
+                            parse_mode=constants.ParseMode.MARKDOWN
+                        )
+                else:
+                    # Get the response of the transcript
+                    response, total_tokens = await self.openai.get_chat_response(chat_id=chat_id, query=transcript)
+
+                    self.usage[user_id].add_chat_tokens(total_tokens, self.config['token_price'])
+                    if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
+                        self.usage["guests"].add_chat_tokens(total_tokens, self.config['token_price'])
+
+                    # Split into chunks of 4096 characters (Telegram's message limit)
+                    transcript_output = (
+                        f"_{localized_text('transcript', bot_language)}:_\n\"{transcript}\"\n\n"
+                        f"_{localized_text('answer', bot_language)}:_\n{response}"
                     )
+                    chunks = split_into_chunks(transcript_output)
 
-        except Exception as e:
-            logging.exception(e)
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                text=f"{localized_text('transcribe_fail', bot_language)}: {str(e)}",
-                parse_mode=constants.ParseMode.MARKDOWN
-            )
-        finally:
-            if os.path.exists(filename_mp3):
-                os.remove(filename_mp3)
-            if os.path.exists(filename):
-                os.remove(filename)
+                    for index, transcript_chunk in enumerate(chunks):
+                        await update.effective_message.reply_text(
+                            message_thread_id=get_thread_id(update),
+                            reply_to_message_id=get_reply_to_message_id(self.config, update) if index == 0 else None,
+                            text=transcript_chunk,
+                            parse_mode=constants.ParseMode.MARKDOWN
+                        )
 
-    await wrap_with_indicator(update, context, _execute, constants.ChatAction.TYPING)
+            except Exception as e:
+                logging.exception(e)
+                await update.effective_message.reply_text(
+                    message_thread_id=get_thread_id(update),
+                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                    text=f"{localized_text('transcribe_fail', bot_language)}: {str(e)}",
+                    parse_mode=constants.ParseMode.MARKDOWN
+                )
+            finally:
+                if os.path.exists(filename_mp3):
+                    os.remove(filename_mp3)
+                if os.path.exists(filename):
+                    os.remove(filename)
 
-async def vision(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Interpret image using vision model."""
-    if not self.config['enable_vision'] or not await self.check_allowed_and_within_budget(update, context):
-        return
+        await wrap_with_indicator(update, context, _execute, constants.ChatAction.TYPING)
 
-    chat_id = update.effective_chat.id
-    prompt = update.message.caption
-
-    if is_group_chat(update):
-        if self.config['ignore_group_vision']:
-            logging.info('Vision coming from group chat, ignoring...')
+    async def vision(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Interpret image using vision model.
+        """
+        if not self.config['enable_vision'] or not await self.check_allowed_and_within_budget(update, context):
             return
-        else:
-            trigger_keyword = self.config['group_trigger_keyword']
-            if (prompt is None and trigger_keyword != '') or \
-               (prompt is not None and not prompt.lower().startswith(trigger_keyword.lower())):
-                logging.info('Vision coming from group chat with wrong keyword, ignoring...')
-                return
 
-    image = update.message.effective_attachment[-1]
-    
-    async def _execute():
-        bot_language = self.config['bot_language']
-        try:
-            # Check for GIF
-            mime_type = getattr(image, 'mime_type', '')
-            if mime_type == 'image/gif':
-                logging.info("GIF received in vision, ignoring.")
-                if self.config.get('notify_gif_rejection', True):
-                    await update.effective_message.reply_text(
-                        message_thread_id=get_thread_id(update),
-                        reply_to_message_id=get_reply_to_message_id(self.config, update),
-                        text=localized_text('gif_not_supported', bot_language),
-                        parse_mode=constants.ParseMode.MARKDOWN
-                    )
-                return
+        chat_id = update.effective_chat.id
+        prompt = update.message.caption
 
-            media_file = await context.bot.get_file(image.file_id)
-            temp_file = io.BytesIO(await media_file.download_as_bytearray())
+        if is_group_chat(update):
+            if self.config['ignore_group_vision']:
+                logging.info('Vision coming from group chat, ignoring...')
+                return
+            else:
+                trigger_keyword = self.config['group_trigger_keyword']
+                if (prompt is None and trigger_keyword != '') or \
+                   (prompt is not None and not prompt.lower().startswith(trigger_keyword.lower())):
+                    logging.info('Vision coming from group chat with wrong keyword, ignoring...')
+                    return
+        
+        image = update.message.effective_attachment[-1]
+        
+
+        async def _execute():
+            bot_language = self.config['bot_language']
+            try:
+                media_file = await context.bot.get_file(image.file_id)
+                temp_file = io.BytesIO(await media_file.download_as_bytearray())
+            except Exception as e:
+                logging.exception(e)
+                await update.effective_message.reply_text(
+                    message_thread_id=get_thread_id(update),
+                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                    text=(
+                        f"{localized_text('media_download_fail', bot_language)[0]}: "
+                        f"{str(e)}. {localized_text('media_download_fail', bot_language)[1]}"
+                    ),
+                    parse_mode=constants.ParseMode.MARKDOWN
+                )
+                return
             
-        except Exception as e:
-            logging.exception(e)
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                text=(
-                    f"{localized_text('media_download_fail', bot_language)[0]}: "
-                    f"{str(e)}. {localized_text('media_download_fail', bot_language)[1]}"
-                ),
-                parse_mode=constants.ParseMode.MARKDOWN
-            )
-            return
+            # convert jpg from telegram to png as understood by openai
 
-        temp_file_png = io.BytesIO()
+            temp_file_png = io.BytesIO()
 
-        try:
-            original_image = Image.open(temp_file)
-            original_image.save(temp_file_png, format='PNG')
-            logging.info(f'New vision request received from user {update.message.from_user.name} '
-                         f'(id: {update.message.from_user.id})')
+            try:
+                original_image = Image.open(temp_file)
+                
+                original_image.save(temp_file_png, format='PNG')
+                logging.info(f'New vision request received from user {update.message.from_user.name} '
+                             f'(id: {update.message.from_user.id})')
 
-        except Exception as e:
-            logging.exception(e)
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                text=localized_text('media_type_fail', bot_language)
-            )
-            return
+            except Exception as e:
+                logging.exception(e)
+                await update.effective_message.reply_text(
+                    message_thread_id=get_thread_id(update),
+                    reply_to_message_id=get_reply_to_message_id(self.config, update),
+                    text=localized_text('media_type_fail', bot_language)
+                )
+            
+            
 
-        user_id = update.message.from_user.id
-        if user_id not in self.usage:
-            self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
+            user_id = update.message.from_user.id
+            if user_id not in self.usage:
+                self.usage[user_id] = UsageTracker(user_id, update.message.from_user.name)
 
-        try:
             if self.config['stream']:
+
                 stream_response = self.openai.interpret_image_stream(chat_id=chat_id, fileobj=temp_file_png, prompt=prompt)
                 i = 0
                 prev = ''
@@ -617,31 +597,35 @@ async def vision(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
                     if tokens != 'not_finished':
                         total_tokens = int(tokens)
 
+                
             else:
-                interpretation, total_tokens = await self.openai.interpret_image(chat_id, temp_file_png, prompt=prompt)
 
                 try:
-                    await update.effective_message.reply_text(
-                        message_thread_id=get_thread_id(update),
-                        reply_to_message_id=get_reply_to_message_id(self.config, update),
-                        text=interpretation,
-                        parse_mode=constants.ParseMode.MARKDOWN
-                    )
-                except BadRequest:
+                    interpretation, total_tokens = await self.openai.interpret_image(chat_id, temp_file_png, prompt=prompt)
+
+
                     try:
                         await update.effective_message.reply_text(
                             message_thread_id=get_thread_id(update),
                             reply_to_message_id=get_reply_to_message_id(self.config, update),
-                            text=interpretation
-                        )
-                    except Exception as e:
-                        logging.exception(e)
-                        await update.effective_message.reply_text(
-                            message_thread_id=get_thread_id(update),
-                            reply_to_message_id=get_reply_to_message_id(self.config, update),
-                            text=f"{localized_text('vision_fail', bot_language)}: {str(e)}",
+                            text=interpretation,
                             parse_mode=constants.ParseMode.MARKDOWN
                         )
+                    except BadRequest:
+                        try:
+                            await update.effective_message.reply_text(
+                                message_thread_id=get_thread_id(update),
+                                reply_to_message_id=get_reply_to_message_id(self.config, update),
+                                text=interpretation
+                            )
+                        except Exception as e:
+                            logging.exception(e)
+                            await update.effective_message.reply_text(
+                                message_thread_id=get_thread_id(update),
+                                reply_to_message_id=get_reply_to_message_id(self.config, update),
+                                text=f"{localized_text('vision_fail', bot_language)}: {str(e)}",
+                                parse_mode=constants.ParseMode.MARKDOWN
+                            )
                 except Exception as e:
                     logging.exception(e)
                     await update.effective_message.reply_text(
@@ -650,7 +634,6 @@ async def vision(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
                         text=f"{localized_text('vision_fail', bot_language)}: {str(e)}",
                         parse_mode=constants.ParseMode.MARKDOWN
                     )
-
             vision_token_price = self.config['vision_token_price']
             self.usage[user_id].add_vision_tokens(total_tokens, vision_token_price)
 
@@ -658,17 +641,7 @@ async def vision(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
             if str(user_id) not in allowed_user_ids and 'guests' in self.usage:
                 self.usage["guests"].add_vision_tokens(total_tokens, vision_token_price)
 
-        except Exception as e:
-            logging.exception(e)
-            await update.effective_message.reply_text(
-                message_thread_id=get_thread_id(update),
-                reply_to_message_id=get_reply_to_message_id(self.config, update),
-                text=f"{localized_text('vision_fail', bot_language)}: {str(e)}",
-                parse_mode=constants.ParseMode.MARKDOWN
-            )
-
-    await wrap_with_indicator(update, context, _execute, constants.ChatAction.TYPING)
-
+        await wrap_with_indicator(update, context, _execute, constants.ChatAction.TYPING)
 
     async def prompt(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """
